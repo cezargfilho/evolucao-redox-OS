@@ -1,195 +1,251 @@
-///! Syscall handlers
+//! # Schemes
+//! A scheme is a primitive for handling filesystem syscalls in Redox.
+//! Schemes accept paths from the kernel for `open`, and file descriptors that they generate
+//! are then passed for operations like `close`, `read`, `write`, etc.
+//!
+//! The kernel validates paths and file descriptors before they are passed to schemes,
+//! also stripping the scheme identifier of paths if necessary.
 
-extern crate syscall;
+use alloc::arc::Arc;
+use alloc::boxed::Box;
+use alloc::BTreeMap;
+use core::sync::atomic::AtomicUsize;
+use spin::{Once, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-pub use self::syscall::{data, error, flag, io, number, scheme};
+use syscall::error::*;
+use syscall::scheme::Scheme;
 
-pub use self::driver::*;
-pub use self::fs::*;
-pub use self::futex::futex;
-pub use self::privilege::*;
-pub use self::process::*;
-pub use self::time::*;
-pub use self::validate::*;
+use self::debug::DebugScheme;
+use self::event::EventScheme;
+use self::env::EnvScheme;
+use self::initfs::InitFsScheme;
+use self::irq::IrqScheme;
+use self::memory::MemoryScheme;
+use self::null::NullScheme;
+use self::pipe::PipeScheme;
+use self::root::RootScheme;
+use self::sys::SysScheme;
+use self::time::TimeScheme;
+use self::zero::ZeroScheme;
 
-use self::data::{SigAction, TimeSpec};
-use self::error::{Error, Result, ENOSYS};
-use self::number::*;
-
-use context::ContextId;
-use interrupt::syscall::SyscallStack;
-use scheme::{FileHandle, SchemeNamespace};
-
-/// Debug
+/// `debug:` - provides access to serial console
 pub mod debug;
 
-/// Driver syscalls
-pub mod driver;
+/// `event:` - allows reading of `Event`s which are registered using `fevent`
+pub mod event;
 
-/// Filesystem syscalls
-pub mod fs;
+/// `env:` - access and modify environmental variables
+pub mod env;
 
-/// Fast userspace mutex
-pub mod futex;
+/// `initfs:` - a readonly filesystem used for initializing the system
+pub mod initfs;
 
-/// Privilege syscalls
-pub mod privilege;
+/// `irq:` - allows userspace handling of IRQs
+pub mod irq;
 
-/// Process syscalls
-pub mod process;
+/// When compiled with "live" feature - `disk:` - embedded filesystem for live disk
+#[cfg(feature="live")]
+pub mod live;
 
-/// Time syscalls
+/// `memory:` - a scheme for accessing physical memory
+pub mod memory;
+
+/// `null:` - a scheme that will discard all writes, and read no bytes
+pub mod null;
+
+/// `pipe:` - used internally by the kernel to implement `pipe`
+pub mod pipe;
+
+/// `:` - allows the creation of userspace schemes, tightly dependent on `user`
+pub mod root;
+
+/// `sys:` - system information, such as the context list and scheme list
+pub mod sys;
+
+/// `time:` - allows reading time, setting timeouts and getting events when they are met
 pub mod time;
 
-/// Validate input
-pub mod validate;
+/// A wrapper around userspace schemes, tightly dependent on `root`
+pub mod user;
 
-//mod print_call;
-//use self::print_call::print_call;
+/// `zero:` - a scheme that will discard all writes, and always fill read buffers with zero
+pub mod zero;
 
+/// Limit on number of schemes
+pub const SCHEME_MAX_SCHEMES: usize = 65536;
 
-#[no_mangle]
-pub extern fn syscall(a: usize, b: usize, c: usize, d: usize, e: usize, f: usize, bp: usize, stack: &mut SyscallStack) -> usize {
-    #[inline(always)]
-    fn inner(a: usize, b: usize, c: usize, d: usize, e: usize, f: usize, bp: usize, stack: &mut SyscallStack) -> Result<usize> {
-        match a & SYS_CLASS {
-            SYS_CLASS_FILE => {
-                let fd = FileHandle::from(b);
-                match a & SYS_ARG {
-                    SYS_ARG_SLICE => file_op_slice(a, fd, validate_slice(c as *const u8, d)?),
-                    SYS_ARG_MSLICE => file_op_mut_slice(a, fd, validate_slice_mut(c as *mut u8, d)?),
-                    _ => match a {
-                        SYS_CLOSE => close(fd),
-                        SYS_DUP => dup(fd, validate_slice(c as *const u8, d)?).map(FileHandle::into),
-                        SYS_DUP2 => dup2(fd, FileHandle::from(c), validate_slice(d as *const u8, e)?).map(FileHandle::into),
-                        SYS_FCNTL => fcntl(fd, c, d),
-                        SYS_FEVENT => fevent(fd, c),
-                        SYS_FUNMAP => funmap(b),
-                        _ => file_op(a, fd, c, d)
-                    }
-                }
-            },
-            SYS_CLASS_PATH => match a {
-                SYS_OPEN => open(validate_slice(b as *const u8, c)?, d).map(FileHandle::into),
-                SYS_CHMOD => chmod(validate_slice(b as *const u8, c)?, d as u16),
-                SYS_RMDIR => rmdir(validate_slice(b as *const u8, c)?),
-                SYS_UNLINK => unlink(validate_slice(b as *const u8, c)?),
-                _ => Err(Error::new(ENOSYS))
-            },
-            _ => match a {
-                SYS_YIELD => sched_yield(),
-                SYS_NANOSLEEP => nanosleep(
-                    validate_slice(b as *const TimeSpec, 1).map(|req| &req[0])?,
-                    if c == 0 {
-                        None
-                    } else {
-                        Some(validate_slice_mut(c as *mut TimeSpec, 1).map(|rem| &mut rem[0])?)
-                    }
-                ),
-                SYS_CLOCK_GETTIME => clock_gettime(b, validate_slice_mut(c as *mut TimeSpec, 1).map(|time| &mut time[0])?),
-                SYS_FUTEX => futex(validate_slice_mut(b as *mut i32, 1).map(|uaddr| &mut uaddr[0])?, c, d as i32, e, f as *mut i32),
-                SYS_BRK => brk(b),
-                SYS_GETPID => getpid().map(ContextId::into),
-                SYS_GETPGID => getpgid(ContextId::from(b)).map(ContextId::into),
-                SYS_GETPPID => getppid().map(ContextId::into),
-                SYS_CLONE => clone(b, bp).map(ContextId::into),
-                SYS_EXIT => exit((b & 0xFF) << 8),
-                SYS_KILL => kill(ContextId::from(b), c),
-                SYS_WAITPID => waitpid(ContextId::from(b), c, d).map(ContextId::into),
-                SYS_CHDIR => chdir(validate_slice(b as *const u8, c)?),
-                SYS_EXECVE => exec(validate_slice(b as *const u8, c)?, validate_slice(d as *const [usize; 2], e)?),
-                SYS_IOPL => iopl(b, stack),
-                SYS_GETCWD => getcwd(validate_slice_mut(b as *mut u8, c)?),
-                SYS_GETEGID => getegid(),
-                SYS_GETENS => getens(),
-                SYS_GETEUID => geteuid(),
-                SYS_GETGID => getgid(),
-                SYS_GETNS => getns(),
-                SYS_GETUID => getuid(),
-                SYS_MKNS => mkns(validate_slice(b as *const [usize; 2], c)?),
-                SYS_SETPGID => setpgid(ContextId::from(b), ContextId::from(c)),
-                SYS_SETREUID => setreuid(b as u32, c as u32),
-                SYS_SETRENS => setrens(SchemeNamespace::from(b), SchemeNamespace::from(c)),
-                SYS_SETREGID => setregid(b as u32, c as u32),
-                SYS_SIGACTION => sigaction(
-                    b,
-                    if c == 0 {
-                        None
-                    } else {
-                        Some(validate_slice(c as *const SigAction, 1).map(|act| &act[0])?)
-                    },
-                    if d == 0 {
-                        None
-                    } else {
-                        Some(validate_slice_mut(d as *mut SigAction, 1).map(|oldact| &mut oldact[0])?)
-                    },
-                    e
-                ),
-                SYS_SIGRETURN => sigreturn(),
-                SYS_PIPE2 => pipe2(validate_slice_mut(b as *mut usize, 2)?, c),
-                SYS_PHYSALLOC => physalloc(b),
-                SYS_PHYSFREE => physfree(b, c),
-                SYS_PHYSMAP => physmap(b, c, d),
-                SYS_PHYSUNMAP => physunmap(b),
-                SYS_VIRTTOPHYS => virttophys(b),
-                _ => Err(Error::new(ENOSYS))
-            }
-        }
+/// Unique identifier for a scheme namespace.
+int_like!(SchemeNamespace, AtomicSchemeNamespace, usize, AtomicUsize);
+
+/// Unique identifier for a scheme.
+int_like!(SchemeId, AtomicSchemeId, usize, AtomicUsize);
+
+pub const ATOMIC_SCHEMEID_INIT: AtomicSchemeId = AtomicSchemeId::default();
+
+/// Unique identifier for a file descriptor.
+int_like!(FileHandle, AtomicFileHandle, usize, AtomicUsize);
+
+/// Scheme list type
+pub struct SchemeList {
+    map: BTreeMap<SchemeId, Arc<Box<Scheme + Send + Sync>>>,
+    names: BTreeMap<SchemeNamespace, BTreeMap<Box<[u8]>, SchemeId>>,
+    next_ns: usize,
+    next_id: usize
+}
+
+impl SchemeList {
+    /// Create a new scheme list.
+    pub fn new() -> Self {
+        let mut list = SchemeList {
+            map: BTreeMap::new(),
+            names: BTreeMap::new(),
+            // Scheme namespaces always start at 1. 0 is a reserved namespace, the null namespace
+            next_ns: 1,
+            next_id: 1
+        };
+        list.new_root();
+        list
     }
 
-    /*
-    let debug = {
-        let contexts = ::context::contexts();
-        if let Some(context_lock) = contexts.current() {
-            let context = context_lock.read();
-            if unsafe { ::core::str::from_utf8_unchecked(&context.name.lock()) } == "file:/bin/acid" {
-                if (a == SYS_WRITE || a == SYS_FSYNC) && (b == 1 || b == 2) {
-                    false
-                } else {
-                    true
-                }
+    /// Initialize a new namespace
+    fn new_ns(&mut self) -> SchemeNamespace {
+        let ns = SchemeNamespace(self.next_ns);
+        self.next_ns += 1;
+        self.names.insert(ns, BTreeMap::new());
+
+        self.insert(ns, Box::new(*b""), |scheme_id| Arc::new(Box::new(RootScheme::new(ns, scheme_id)))).unwrap();
+        self.insert(ns, Box::new(*b"event"), |_| Arc::new(Box::new(EventScheme::new()))).unwrap();
+        self.insert(ns, Box::new(*b"env"), |_| Arc::new(Box::new(EnvScheme::new()))).unwrap();
+        self.insert(ns, Box::new(*b"memory"), |_| Arc::new(Box::new(MemoryScheme))).unwrap();
+        self.insert(ns, Box::new(*b"null"), |_| Arc::new(Box::new(NullScheme))).unwrap();
+        self.insert(ns, Box::new(*b"sys"), |_| Arc::new(Box::new(SysScheme::new()))).unwrap();
+        self.insert(ns, Box::new(*b"time"), |scheme_id| Arc::new(Box::new(TimeScheme::new(scheme_id)))).unwrap();
+        self.insert(ns, Box::new(*b"zero"), |_| Arc::new(Box::new(ZeroScheme))).unwrap();
+
+        ns
+    }
+
+    /// Initialize the root namespace
+    #[cfg(not(feature="live"))]
+    fn new_root(&mut self) {
+        // Do common namespace initialization
+        let ns = self.new_ns();
+
+        // Debug, Initfs and IRQ are only available in the root namespace. Pipe is special
+        self.insert(ns, Box::new(*b"debug"), |scheme_id| Arc::new(Box::new(DebugScheme::new(scheme_id)))).unwrap();
+        self.insert(ns, Box::new(*b"initfs"), |_| Arc::new(Box::new(InitFsScheme::new()))).unwrap();
+        self.insert(ns, Box::new(*b"irq"), |scheme_id| Arc::new(Box::new(IrqScheme::new(scheme_id)))).unwrap();
+        self.insert(ns, Box::new(*b"pipe"), |scheme_id| Arc::new(Box::new(PipeScheme::new(scheme_id)))).unwrap();
+    }
+
+    /// Initialize the root namespace - with live disk
+    #[cfg(feature="live")]
+    fn new_root(&mut self) {
+        // Do common namespace initialization
+        let ns = self.new_ns();
+
+        // Debug, Disk, Initfs and IRQ are only available in the root namespace. Pipe is special
+        self.insert(ns, Box::new(*b"debug"), |scheme_id| Arc::new(Box::new(DebugScheme::new(scheme_id)))).unwrap();
+        self.insert(ns, Box::new(*b"disk/live"), |_| Arc::new(Box::new(self::live::DiskScheme::new()))).unwrap();
+        self.insert(ns, Box::new(*b"initfs"), |_| Arc::new(Box::new(InitFsScheme::new()))).unwrap();
+        self.insert(ns, Box::new(*b"irq"), |scheme_id| Arc::new(Box::new(IrqScheme::new(scheme_id)))).unwrap();
+        self.insert(ns, Box::new(*b"pipe"), |scheme_id| Arc::new(Box::new(PipeScheme::new(scheme_id)))).unwrap();
+    }
+
+    pub fn make_ns(&mut self, from: SchemeNamespace, names: &[&[u8]]) -> Result<SchemeNamespace> {
+        // Create an empty namespace
+        let to = self.new_ns();
+
+        // Copy requested scheme IDs
+        for name in names.iter() {
+            let id = if let Some((id, _scheme)) = self.get_name(from, name) {
+                id
             } else {
-                false
+                return Err(Error::new(ENODEV));
+            };
+
+            if let Some(ref mut names) = self.names.get_mut(&to) {
+                assert!(names.insert(name.to_vec().into_boxed_slice(), id).is_none());
+            } else {
+                panic!("scheme namespace not found");
             }
+        }
+
+        Ok(to)
+    }
+
+    pub fn iter(&self) -> ::alloc::btree_map::Iter<SchemeId, Arc<Box<Scheme + Send + Sync>>> {
+        self.map.iter()
+    }
+
+    pub fn iter_name(&self, ns: SchemeNamespace) -> ::alloc::btree_map::Iter<Box<[u8]>, SchemeId> {
+        self.names[&ns].iter()
+    }
+
+    /// Get the nth scheme.
+    pub fn get(&self, id: SchemeId) -> Option<&Arc<Box<Scheme + Send + Sync>>> {
+        self.map.get(&id)
+    }
+
+    pub fn get_name(&self, ns: SchemeNamespace, name: &[u8]) -> Option<(SchemeId, &Arc<Box<Scheme + Send + Sync>>)> {
+        if let Some(&id) = self.names[&ns].get(name) {
+            self.get(id).map(|scheme| (id, scheme))
         } else {
-            false
-        }
-    };
-
-    if debug {
-        let contexts = ::context::contexts();
-        if let Some(context_lock) = contexts.current() {
-            let context = context_lock.read();
-            print!("{} ({}): ", unsafe { ::core::str::from_utf8_unchecked(&context.name.lock()) }, context.id.into());
-        }
-
-        let _ = debug::print_call(a, b, c, d, e, f);
-        println!("");
-    }
-    */
-
-    let result = inner(a, b, c, d, e, f, bp, stack);
-
-    /*
-    if debug {
-        let contexts = ::context::contexts();
-        if let Some(context_lock) = contexts.current() {
-            let context = context_lock.read();
-            print!("{} ({}): ", unsafe { ::core::str::from_utf8_unchecked(&context.name.lock()) }, context.id.into());
-        }
-
-        let _ = debug::print_call(a, b, c, d, e, f);
-
-        match result {
-            Ok(ref ok) => {
-                println!(" = Ok({} ({:#X}))", ok, ok);
-            },
-            Err(ref err) => {
-                println!(" = Err({} ({:#X}))", err, err.errno);
-            }
+            None
         }
     }
-    */
 
-    Error::mux(result)
+    /// Create a new scheme.
+    pub fn insert<F>(&mut self, ns: SchemeNamespace, name: Box<[u8]>, scheme_fn: F) -> Result<SchemeId>
+        where F: Fn(SchemeId) -> Arc<Box<Scheme + Send + Sync>>
+    {
+        if self.names[&ns].contains_key(&name) {
+            return Err(Error::new(EEXIST));
+        }
+
+        if self.next_id >= SCHEME_MAX_SCHEMES {
+            self.next_id = 1;
+        }
+
+        while self.map.contains_key(&SchemeId(self.next_id)) {
+            self.next_id += 1;
+        }
+
+        /* Allow scheme list to grow if required
+        if self.next_id >= SCHEME_MAX_SCHEMES {
+            return Err(Error::new(EAGAIN));
+        }
+        */
+
+        let id = SchemeId(self.next_id);
+        self.next_id += 1;
+
+        let scheme = scheme_fn(id);
+
+        assert!(self.map.insert(id, scheme).is_none());
+        if let Some(ref mut names) = self.names.get_mut(&ns) {
+            assert!(names.insert(name, id).is_none());
+        } else {
+            panic!("scheme namespace not found");
+        }
+        Ok(id)
+    }
+}
+
+/// Schemes list
+static SCHEMES: Once<RwLock<SchemeList>> = Once::new();
+
+/// Initialize schemes, called if needed
+fn init_schemes() -> RwLock<SchemeList> {
+    RwLock::new(SchemeList::new())
+}
+
+/// Get the global schemes list, const
+pub fn schemes() -> RwLockReadGuard<'static, SchemeList> {
+    SCHEMES.call_once(init_schemes).read()
+}
+
+/// Get the global schemes list, mutable
+pub fn schemes_mut() -> RwLockWriteGuard<'static, SchemeList> {
+    SCHEMES.call_once(init_schemes).write()
 }
